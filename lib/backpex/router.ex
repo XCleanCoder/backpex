@@ -131,8 +131,10 @@ defmodule Backpex.Router do
   def get_path(socket, module, params, action, params_or_item \\ %{}) do
     route_path = get_route_path(socket, module, action)
 
-    if Map.has_key?(params_or_item, :id) do
-      id = params_or_item |> Map.get(:id) |> to_string() |> URI.encode()
+    id_field = module.get_primary_key_field()
+
+    if Map.has_key?(params_or_item, id_field) do
+      id = params_or_item |> Map.get(id_field) |> to_string() |> URI.encode_www_form()
 
       put_route_params(route_path, Map.put(params, "backpex_id", maybe_to_string(id)))
     else
@@ -141,15 +143,18 @@ defmodule Backpex.Router do
     end
   end
 
-  def get_path(socket, module, params, action, %{id: id}, query_params) do
-    get_path(socket, module, params, action, id, query_params)
-  end
+  def get_path(socket, module, params, action, id_or_instance, query_params) do
+    id_field = module.get_primary_key_field()
 
-  def get_path(socket, module, params, action, id, query_params) do
+    id_serializable =
+      if is_map(id_or_instance) and Map.has_key?(id_or_instance, id_field),
+        do: Map.get(id_or_instance, id_field),
+        else: id_or_instance
+
     route_path = get_route_path(socket, module, action)
     query_params = Query.encode(query_params)
 
-    put_route_params(route_path, Map.put(params, "backpex_id", maybe_to_string(id)))
+    put_route_params(route_path, Map.put(params, "backpex_id", maybe_to_string(id_serializable)))
     |> maybe_put_query_params(query_params)
   end
 
@@ -158,7 +163,7 @@ defmodule Backpex.Router do
 
   defp get_route_path(socket, module, action) do
     %{path: path} =
-      Enum.find(Map.get(socket, :router).__routes__, fn element ->
+      Enum.find(Map.get(socket, :router).__routes__(), fn element ->
         element[:metadata][:log_module] == module and element[:plug_opts] == action
       end)
 
@@ -174,6 +179,8 @@ defmodule Backpex.Router do
       "/123/events/xyz/show"
       iex> Backpex.Router.put_route_params("/:param1/events/:id/edit", %{"param1" => "123", "id" => "xyz"})
       "/123/events/xyz/edit"
+      iex> Backpex.Router.put_route_params("/:param1/events/:id/edit", %{"param1" => "123", "id" => "hällö / world"})
+      "/123/events/h%C3%A4ll%C3%B6+%2F+world/edit"
       iex> Backpex.Router.put_route_params("/events", %{"param1" => "123", "param2" => "xyz"})
       "/events"
       iex> Backpex.Router.put_route_params("/events", %{})
@@ -184,9 +191,21 @@ defmodule Backpex.Router do
     |> String.split("/")
     |> Enum.reduce("", fn
       "", acc -> acc
-      ":" <> param, acc -> acc <> "/#{params[param]}"
+      ":" <> param, acc -> acc <> "/#{URI.encode_www_form(params[param])}"
       path, acc -> acc <> "/#{path}"
     end)
+  end
+
+  @doc """
+  Finds the cookie path by the given socket.
+  """
+  def cookie_path(socket) do
+    %{path: path} =
+      Enum.find(Map.get(socket, :router).__routes__(), fn element ->
+        element[:plug] == Backpex.CookieController and element[:plug_opts] == :update
+      end)
+
+    path
   end
 
   defp maybe_to_string(value) when is_atom(value), do: Atom.to_string(value)

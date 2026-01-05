@@ -73,6 +73,11 @@ defmodule DemoWeb.ProductLive do
 
           error ->
             error
+        end,
+        render: fn assigns ->
+          ~H"""
+          <p><%= Number.Delimit.number_to_delimited(@value, precision: 0, delimiter: ".") %></p>
+          """
         end
       },
       price: %{
@@ -93,6 +98,22 @@ defmodule DemoWeb.ProductLive do
           url: %{
             module: Backpex.Fields.Text,
             label: "URL"
+          }
+        ]
+      },
+      short_links: %{
+        module: Backpex.Fields.InlineCRUD,
+        label: "Short Links",
+        type: :assoc,
+        except: [:index],
+        child_fields: [
+          short_key: %{
+            module: Backpex.Fields.Text,
+            label: "URL Suffix"
+          },
+          url: %{
+            module: Backpex.Fields.Text,
+            label: "Target URL"
           }
         ]
       }

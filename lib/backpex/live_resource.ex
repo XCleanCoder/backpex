@@ -13,12 +13,12 @@ defmodule Backpex.LiveResource do
   alias Backpex.Resource
 
   @doc """
-  A list of [resource_actions](resource_actions.html) that may be performed on the given resource.
+  A list of [resource_actions](Backpex.ResourceAction.html) that may be performed on the given resource.
   """
   @callback resource_actions() :: list()
 
   @doc """
-  A list of [item_actions](item_actions.html) that may be performed on (selected) items.
+  A list of [item_actions](Backpex.ItemAction.html) that may be performed on (selected) items.
   """
   @callback item_actions(default_actions :: list(map())) :: list()
 
@@ -83,12 +83,12 @@ defmodule Backpex.LiveResource do
               %Phoenix.LiveView.Rendered{}
 
   @doc """
-  A optional keyword list of [filters](filters.html) to be used on the index view.
+  A optional keyword list of [filters](Backpex.Filter.html) to be used on the index view.
   """
   @callback filters() :: keyword()
 
   @doc """
-  A optional keyword list of [filters](filters.html) to be used on the index view.
+  A optional keyword list of [filters](Backpex.Filter.html) to be used on the index view.
   """
   @callback filters(assigns :: map()) :: keyword()
 
@@ -130,6 +130,11 @@ defmodule Backpex.LiveResource do
   Customizes the message in the flash message when a resource has been created successfully. Defaults to "New %{resource} has been created successfully".
   """
   @callback resource_created_message() :: binary()
+
+  @doc """
+  Returns the schema of the live resource.
+  """
+  @callback schema() :: module()
 
   @doc """
   Uses LiveResource in the current module to make it a LiveResource.
@@ -207,6 +212,7 @@ defmodule Backpex.LiveResource do
 
       @permitted_order_directions ~w(asc desc)a
       @empty_filter_key :empty_filter
+      @primary_key_field Backpex.Ecto.EctoUtils.get_primary_key_field(unquote(schema))
 
       @impl Phoenix.LiveView
       def mount(params, session, socket) do
@@ -313,7 +319,10 @@ defmodule Backpex.LiveResource do
         } = socket
 
         fields = filtered_fields_by_action(fields(), assigns, :edit)
-        item = Resource.get!(params["backpex_id"], repo, schema, &item_query(&1, live_action, assigns), fields)
+
+        item =
+          URI.decode(params["backpex_id"])
+          |> Resource.get!(repo, schema, &item_query(&1, live_action, assigns), fields)
 
         unless can?(socket.assigns, :edit, item, __MODULE__),
           do: raise(Backpex.ForbiddenError)
@@ -342,7 +351,10 @@ defmodule Backpex.LiveResource do
         } = socket
 
         fields = filtered_fields_by_action(fields(), assigns, :show)
-        item = Resource.get!(params["backpex_id"], repo, schema, &item_query(&1, live_action, assigns), fields)
+
+        item =
+          URI.decode(params["backpex_id"])
+          |> Resource.get!(repo, schema, &item_query(&1, live_action, assigns), fields)
 
         unless can?(assigns, :show, item, __MODULE__),
           do: raise(Backpex.ForbiddenError)
@@ -377,7 +389,12 @@ defmodule Backpex.LiveResource do
       end
 
       def apply_action(socket, :resource_action) do
-        id = String.to_existing_atom(socket.assigns.params["backpex_id"])
+        id =
+          String.to_existing_atom(
+            socket.assigns.params["backpex_id"]
+            |> URI.decode()
+          )
+
         action = resource_actions()[id]
 
         unless can?(socket.assigns, id, nil, __MODULE__),
@@ -500,12 +517,14 @@ defmodule Backpex.LiveResource do
             } = assigns
         } = socket
 
+        metadata = Resource.build_changeset_metadata(assigns)
+
         changeset =
           Backpex.LiveResource.call_changeset_function(
             item,
             changeset_function,
             default_attrs(live_action, fields, assigns),
-            assigns
+            metadata
           )
 
         socket
@@ -643,7 +662,7 @@ defmodule Backpex.LiveResource do
 
       @impl Phoenix.LiveView
       def handle_event("item-action", %{"action-key" => key, "item-id" => item_id}, socket) do
-        item = Enum.find(socket.assigns.items, fn item -> to_string(item.id) == to_string(item_id) end)
+        item = Enum.find(socket.assigns.items, fn item -> to_string(primary_key(item)) == to_string(item_id) end)
 
         socket
         |> assign(selected_items: [item])
@@ -670,10 +689,12 @@ defmodule Backpex.LiveResource do
         init_change = action.module.init_change(socket.assigns)
         changeset_function = &action.module.changeset/3
 
+        metadata = Resource.build_changeset_metadata(socket.assigns)
+
         changeset =
           init_change
           |> Ecto.Changeset.change()
-          |> call_changeset_function(changeset_function, %{}, socket.assigns)
+          |> call_changeset_function(changeset_function, %{}, metadata)
 
         socket =
           socket
@@ -829,7 +850,7 @@ defmodule Backpex.LiveResource do
       def handle_event("update-selected-items", %{"id" => id}, socket) do
         selected_items = socket.assigns.selected_items
 
-        item = Enum.find(socket.assigns.items, fn item -> to_string(item.id) == to_string(id) end)
+        item = Enum.find(socket.assigns.items, fn item -> to_string(primary_key(item)) == to_string(id) end)
 
         updated_selected_items =
           if Enum.member?(selected_items, item) do
@@ -876,7 +897,7 @@ defmodule Backpex.LiveResource do
       @impl Phoenix.LiveView
       def handle_info({"backpex:" <> unquote(event_prefix) <> "deleted", item}, socket)
           when socket.assigns.live_action in [:index, :resource_action] do
-        if Enum.filter(socket.assigns.items, &(to_string(&1.id) == to_string(item.id))) != [] do
+        if Enum.filter(socket.assigns.items, &(to_string(primary_key(&1)) == to_string(primary_key(item)))) != [] do
           {:noreply, refresh_items(socket)}
         else
           {:noreply, socket}
@@ -922,6 +943,12 @@ defmodule Backpex.LiveResource do
 
       def get_empty_filter_key, do: @empty_filter_key
 
+      def get_primary_key_field, do: @primary_key_field
+
+      defp primary_key(item), do: Map.get(item, @primary_key_field)
+
+      defp primary_key(assigns, item), do: Map.get(item, assigns.primary_key_field)
+
       defp update_item(socket, %{id: id} = _item) do
         %{assigns: %{live_action: live_action, repo: repo, schema: schema} = assigns} = socket
 
@@ -931,7 +958,7 @@ defmodule Backpex.LiveResource do
         socket =
           cond do
             live_action in [:index, :resource_action] and item ->
-              items = Enum.map(socket.assigns.items, &if(&1.id == id, do: item, else: &1))
+              items = Enum.map(socket.assigns.items, &if(primary_key(&1) == id, do: item, else: &1))
 
               assign(socket, :items, items)
 
@@ -1020,6 +1047,9 @@ defmodule Backpex.LiveResource do
 
       @impl Backpex.LiveResource
       def create_button_label, do: Backpex.translate({"New %{resource}", %{resource: singular_name()}})
+
+      @impl Backpex.LiveResource
+      def schema, do: unquote(schema)
 
       @impl Backpex.LiveResource
       def resource_created_message,
@@ -1510,12 +1540,7 @@ defmodule Backpex.LiveResource do
   @doc """
   Calls the changeset function with the given change and target.
   """
-  def call_changeset_function(item, changeset_function, change, assigns, target \\ nil) do
-    metadata =
-      Keyword.new()
-      |> Keyword.put(:assigns, assigns)
-      |> Keyword.put(:target, target)
-
+  def call_changeset_function(item, changeset_function, change, metadata) do
     changeset_function.(item, change, metadata)
   end
 

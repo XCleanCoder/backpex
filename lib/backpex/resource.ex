@@ -4,6 +4,7 @@ defmodule Backpex.Resource do
   """
   import Ecto.Query
 
+  alias Backpex.Ecto.EctoUtils
   alias Backpex.LiveResource
 
   @doc """
@@ -106,11 +107,15 @@ defmodule Backpex.Resource do
       %{queryable: queryable, owner_key: owner_key, cardinality: :one} = association, query ->
         custom_alias = Map.get(association, :custom_alias, name_by_schema(queryable))
 
-        from(item in query,
-          left_join: b in ^queryable,
-          as: ^custom_alias,
-          on: field(item, ^owner_key) == b.id
-        )
+        if has_named_binding?(query, custom_alias) do
+          query
+        else
+          from(item in query,
+            left_join: b in ^queryable,
+            as: ^custom_alias,
+            on: field(item, ^owner_key) == field(b, ^EctoUtils.get_primary_key_field(queryable))
+          )
+        end
 
       _relation, query ->
         query
@@ -250,7 +255,7 @@ defmodule Backpex.Resource do
     |> apply_filters(filter_options, live_resource.get_empty_filter_key())
     |> exclude(:preload)
     |> subquery()
-    |> repo.aggregate(:count, :id)
+    |> repo.aggregate(:count)
   end
 
   @doc """
@@ -287,33 +292,35 @@ defmodule Backpex.Resource do
 
   defp record_query(id, schema, item_query, fields) do
     schema_name = name_by_schema(schema)
-    id_type = schema.__schema__(:type, :id)
+
+    id_field = EctoUtils.get_primary_key_field(schema)
+    id_type = schema.__schema__(:type, id_field)
     associations = associations(fields, schema)
 
-    from(item in schema, as: ^schema_name, distinct: item.id)
+    from(item in schema, as: ^schema_name, distinct: field(item, ^id_field))
     |> item_query.()
     |> maybe_join(associations)
     |> maybe_preload(associations, fields)
     |> maybe_merge_dynamic_fields(fields)
-    |> where_id(schema_name, id_type, id)
+    |> where_id(schema_name, id_field, id_type, id)
   end
 
-  defp where_id(query, schema_name, :id, id) do
+  defp where_id(query, schema_name, id_field, :id, id) do
     case Ecto.Type.cast(:id, id) do
-      {:ok, valid_id} -> where(query, [{^schema_name, schema_name}], schema_name.id == ^valid_id)
+      {:ok, valid_id} -> where(query, [{^schema_name, schema_name}], field(schema_name, ^id_field) == ^valid_id)
       :error -> raise Ecto.NoResultsError, queryable: query
     end
   end
 
-  defp where_id(query, schema_name, :binary_id, id) do
+  defp where_id(query, schema_name, id_field, :binary_id, id) do
     case Ecto.UUID.cast(id) do
-      {:ok, valid_id} -> where(query, [{^schema_name, schema_name}], schema_name.id == ^valid_id)
+      {:ok, valid_id} -> where(query, [{^schema_name, schema_name}], field(schema_name, ^id_field) == ^valid_id)
       :error -> raise Ecto.NoResultsError, queryable: query
     end
   end
 
-  defp where_id(query, schema_name, _id_type, id) do
-    where(query, [{^schema_name, schema_name}], schema_name.id == ^id)
+  defp where_id(query, schema_name, id_field, _id_type, id) do
+    where(query, [{^schema_name, schema_name}], field(schema_name, ^id_field) == ^id)
   end
 
   @doc """
@@ -344,8 +351,10 @@ defmodule Backpex.Resource do
   * `pubsub` (map, default: `nil`): The PubSub config to use for broadcasting events.
   """
   def delete_all(items, repo, schema, pubsub \\ nil) do
+    id_field = EctoUtils.get_primary_key_field(schema)
+
     case schema
-         |> where([i], i.id in ^Enum.map(items, & &1.id))
+         |> where([i], field(i, ^id_field) in ^Enum.map(items, &Map.get(&1, id_field)))
          |> repo.delete_all() do
       {_count_, nil} ->
         Enum.each(items, fn item -> broadcast({:ok, item}, "deleted", pubsub) end)
@@ -364,6 +373,7 @@ defmodule Backpex.Resource do
   * `item` (struct): The Ecto schema struct.
   * `attrs` (map): A map of parameters that will be passed to the `changeset_function`.
   * `repo` (module): The repository module.
+  * `fields` (keyword): The keyword list of fields defined in the live resource.
   * `changeset_function` (function): The function that transforms the item and parameters into a changeset.
   * `opts` (keyword list): A list of options for customizing the behavior of the insert function. The available options are:
     * `:assigns` (map, default: `%{}`): The assigns that will be passed to the changeset function.
@@ -371,14 +381,14 @@ defmodule Backpex.Resource do
     * `:assocs` (list, default: `[]`): A list of associations.
     * `:after_save` (function, default: `&{:ok, &1}`): A function to handle operations after the save.
   """
-  def update(item, attrs, repo, changeset_function, opts) do
+  def update(item, attrs, repo, fields, changeset_function, opts) do
     assigns = Keyword.get(opts, :assigns, %{})
     pubsub = Keyword.get(opts, :pubsub, nil)
     assocs = Keyword.get(opts, :assocs, [])
     after_save = Keyword.get(opts, :after_save, &{:ok, &1})
 
     item
-    |> change(attrs, changeset_function, assigns, assocs, nil, :update)
+    |> change(attrs, changeset_function, repo, fields, assigns, assocs: assocs, action: :update)
     |> repo.update()
     |> after_save(after_save)
     |> broadcast("updated", pubsub)
@@ -398,8 +408,10 @@ defmodule Backpex.Resource do
   * `pubsub` (map, default: `nil`): The PubSub config to use for broadcasting events.
   """
   def update_all(items, repo, schema, updates, event_name \\ "updated", pubsub \\ nil) do
+    id_field = EctoUtils.get_primary_key_field(schema)
+
     case schema
-         |> where([i], i.id in ^Enum.map(items, & &1.id))
+         |> where([i], field(i, ^id_field) in ^Enum.map(items, &Map.get(&1, id_field)))
          |> repo.update_all(updates) do
       {_count_, nil} ->
         Enum.each(items, fn item -> broadcast({:ok, item}, event_name, pubsub) end)
@@ -418,6 +430,7 @@ defmodule Backpex.Resource do
   * `item` (struct): The Ecto schema struct.
   * `attrs` (map): A map of parameters that will be passed to the `changeset_function`.
   * `repo` (module): The repository module.
+  * `fields` (keyword): The keyword list of fields defined in the live resource.
   * `changeset_function` (function): The function that transforms the item and parameters into a changeset.
   * `opts` (keyword list): A list of options for customizing the behavior of the insert function. The available options are:
     * `:assigns` (map, default: `%{}`): The assigns that will be passed to the changeset function.
@@ -425,14 +438,14 @@ defmodule Backpex.Resource do
     * `:assocs` (list, default: `[]`): A list of associations.
     * `:after_save` (function, default: `&{:ok, &1}`): A function to handle operations after the save.
   """
-  def insert(item, attrs, repo, changeset_function, opts) do
+  def insert(item, attrs, repo, fields, changeset_function, opts) do
     assigns = Keyword.get(opts, :assigns, %{})
     pubsub = Keyword.get(opts, :pubsub, nil)
     assocs = Keyword.get(opts, :assocs, [])
     after_save = Keyword.get(opts, :after_save, &{:ok, &1})
 
     item
-    |> change(attrs, changeset_function, assigns, assocs, nil, :insert)
+    |> change(attrs, changeset_function, repo, fields, assigns, assocs: assocs, action: :insert)
     |> repo.insert()
     |> after_save(after_save)
     |> broadcast("created", pubsub)
@@ -440,6 +453,7 @@ defmodule Backpex.Resource do
 
   @doc """
   Applies a change to a given item by calling the specified changeset function.
+  In addition, puts the given assocs into the function and calls the `c:Backpex.Field.before_changeset/6` callback for each field.
 
   ## Parameters
 
@@ -447,29 +461,49 @@ defmodule Backpex.Resource do
   * `attrs`: A map of attributes that will be used to modify the item. These attributes are passed to the changeset function.
   * `changeset_function`: A function used to generate the changeset. This function is usually defined elsewhere in your codebase and should follow the changeset Ecto convention.
   * `assigns`: The assigns that will be passed to the changeset function.
-  * `assocs` (optional, default `[]`): A list of associations that should be put into the changeset.
-  * `target` (optional, default `nil`): The target to be passed to the changeset function.
-  * `action` (optional, default `:validate`): An atom indicating the action to be performed on the changeset.
+  * `opts` (keyword list): A list of options for customizing the behavior of the change function. The available options are:
+    * `assocs` (optional, default `[]`): A list of associations that should be put into the changeset.
+    * `target` (optional, default `nil`): The target to be passed to the changeset function.
+    * `action` (optional, default `:validate`): An atom indicating the action to be performed on the changeset.
   """
-  def change(item, attrs, changeset_function, assigns, assocs \\ [], target \\ nil, action \\ :validate) do
-    Ecto.Changeset.change(item)
+  def change(item, attrs, changeset_function, repo, fields, assigns, opts \\ []) do
+    assocs = Keyword.get(opts, :assocs, [])
+    target = Keyword.get(opts, :target, nil)
+    action = Keyword.get(opts, :action, :validate)
+    metadata = build_changeset_metadata(assigns, target)
+
+    item
+    |> Ecto.Changeset.change()
+    |> before_changesets(attrs, metadata, repo, fields, assigns)
     |> put_assocs(assocs)
-    |> LiveResource.call_changeset_function(changeset_function, attrs, assigns, target)
+    |> LiveResource.call_changeset_function(changeset_function, attrs, metadata)
     |> Map.put(:action, action)
   end
 
-  @doc """
-  Updates an Ecto changeset with a list of associations. It takes an existing changeset and a list of associations, and it updates the changeset with each association using `Ecto.Changeset.put_assoc/3`.
+  def before_changesets(changeset, attrs, metadata, repo, fields, assigns) do
+    Enum.reduce(fields, changeset, fn {_name, field_options} = field, acc ->
+      field_options.module.before_changeset(acc, attrs, metadata, repo, field, assigns)
+    end)
+  end
 
-  ## Parameters
-
-  * `changeset`: The changeset that you want to update with new associations.
-  * `assocs` (keyword): A keyword list of associations to be added to the changeset. Each element should be a tuple with the association's key as the first element and the associated value as the second element.
-  """
-  def put_assocs(changeset, assocs) do
+  defp put_assocs(changeset, assocs) do
     Enum.reduce(assocs, changeset, fn {key, value}, acc ->
       Ecto.Changeset.put_assoc(acc, key, value)
     end)
+  end
+
+  @doc """
+  Builds metadata passed to changeset functions.
+
+  ## Parameters
+
+  * `assigns`: The assigns that will be passed to the changeset function.
+  * `target` (optional, default `nil`): The target to be passed to the changeset function.
+  """
+  def build_changeset_metadata(assigns, target \\ nil) do
+    Keyword.new()
+    |> Keyword.put(:assigns, assigns)
+    |> Keyword.put(:target, target)
   end
 
   @doc """
@@ -511,11 +545,31 @@ defmodule Backpex.Resource do
     fields
     |> Enum.filter(fn {_name, field_options} = field -> field_options.module.association?(field) end)
     |> Enum.map(fn
-      {name, %{custom_alias: custom_alias}} ->
-        schema.__schema__(:association, name) |> Map.from_struct() |> Map.put(:custom_alias, custom_alias)
+      {name, field_options} ->
+        association = schema.__schema__(:association, name)
 
-      {name, _field_options} ->
-        schema.__schema__(:association, name) |> Map.from_struct()
+        if association == nil do
+          name_str = name |> Atom.to_string()
+          without_id = String.replace(name_str, ~r/_id$/, "")
+
+          # credo:disable-for-lines:3 Credo.Check.Refactor.Nesting
+          raise """
+          The field "#{name}"" is not an association but used as if it were one with the field module #{inspect(field_options.module)}.
+          #{if without_id != name_str,
+            do: """
+            You are using a field ending with _id. Please make sure to use the correct field name for the association. Try using the name of the association, maybe "#{without_id}"?
+            """,
+            else: ""}.
+          """
+        end
+
+        case field_options do
+          %{custom_alias: custom_alias} ->
+            association |> Map.from_struct() |> Map.put(:custom_alias, custom_alias)
+
+          _ ->
+            association |> Map.from_struct()
+        end
     end)
   end
 end
